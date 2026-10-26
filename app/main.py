@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
 import logging.config
-import socket
 import sys
 import signal
 import websockets
@@ -18,6 +17,7 @@ logging.basicConfig(level="INFO", format="%(asctime)s - %(message)s")
 
 # Init logger
 logger = logging.getLogger(__name__)
+RECONNECT_DELAY = 5
 
 logger.info("Starting tydom2mqtt")
 
@@ -59,39 +59,32 @@ async def listen_tydom():
             await tydom_client.setup()
             while True:
                 try:
-                    try:
-                        incoming_bytes_str = await asyncio.wait_for(
-                            tydom_client.connection.recv(),
-                            timeout=tydom_client.polling_interval,
-                        )
-                    except asyncio.TimeoutError:
-                        # No message within the window: the task is still alive
-                        # and listening. Refresh the heartbeat (liveness) without
-                        # touching the message-freshness clock, then keep waiting.
-                        health_state.update_task_heartbeat("listen_tydom")
-                        continue
-                    health_state.update_task_heartbeat("listen_tydom")
-                    health_state.update_tydom_message_time()
-                    message_handler = MessageHandler(
-                        incoming_bytes=incoming_bytes_str,
-                        tydom_client=tydom_client,
-                        mqtt_client=mqtt_client,
+                    incoming_bytes_str = await asyncio.wait_for(
+                        tydom_client.connection.recv(),
+                        timeout=tydom_client.polling_interval,
                     )
-                    await message_handler.incoming_triage()
-                except websockets.ConnectionClosed as e:
-                    logger.error("Websocket connection closed: %s", e)
-                    await tydom_client.disconnect()
-                    break
-                except Exception as e:
-                    logger.warning("Unable to handle message: %s", e)
-                    await tydom_client.disconnect()
-
-        except socket.gaierror as e:
-            logger.error("Socket error (%s)", e)
-            sys.exit(1)
-        except ConnectionRefusedError as e:
-            logger.error("Connection refused (%s)", e)
-            sys.exit(1)
+                except asyncio.TimeoutError:
+                    # A quiet connection is live, but doesn't prove fresh data.
+                    health_state.update_task_heartbeat("listen_tydom")
+                    continue
+                health_state.update_task_heartbeat("listen_tydom")
+                health_state.update_tydom_message_time()
+                message_handler = MessageHandler(
+                    incoming_bytes=incoming_bytes_str,
+                    tydom_client=tydom_client,
+                    mqtt_client=mqtt_client,
+                )
+                await message_handler.incoming_triage()
+        except (websockets.ConnectionClosed, OSError) as e:
+            # Setup sends requests too, so it must share the receive retry boundary.
+            logger.warning(
+                "Tydom connection lost (%s); reconnecting in %s seconds",
+                e,
+                RECONNECT_DELAY,
+            )
+        finally:
+            await tydom_client.disconnect()
+        await asyncio.sleep(RECONNECT_DELAY)
 
 
 async def poll_device_tydom():
@@ -102,9 +95,21 @@ async def poll_device_tydom():
             # Heartbeat after a successful refresh so a hung post_refresh()
             # goes stale and is detected instead of looking alive for a cycle.
             health_state.update_task_heartbeat("poll_device_tydom")
-        except Exception as e:
-            logger.warning("poll_device_tydom error : %s", e)
-            break
+        except (websockets.ConnectionClosed, OSError) as e:
+            logger.warning("Tydom refresh failed; retrying next polling cycle (%s)", e)
+
+
+def exit_on_task_failure(task):
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Critical task %s failed", task.get_name())
+    else:
+        logger.error("Critical task %s stopped unexpectedly", task.get_name())
+    # A running event loop with a dead listener/poller defeats the HA watchdog.
+    sys.exit(1)
 
 
 # Create tydom client
@@ -168,8 +173,9 @@ def main():
         loop.run_until_complete(health_server.start())
 
     loop.create_task(mqtt_client.connect())
-    loop.create_task(listen_tydom())
-    loop.create_task(poll_device_tydom())
+    for background_task in (listen_tydom, poll_device_tydom):
+        task = loop.create_task(background_task(), name=background_task.__name__)
+        task.add_done_callback(exit_on_task_failure)
     loop.run_forever()
 
 

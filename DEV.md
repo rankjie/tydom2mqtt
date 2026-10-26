@@ -17,6 +17,13 @@ cd app && ruff check .       # lint
 cd app && pytest
 ```
 
+### Connection recovery
+The Tydom listener retries transport failures during connection, setup, and
+message reception after five seconds. A failed refresh is retried on the next
+polling cycle. Unexpected listener or polling failures stop the process with a
+nonzero exit status so the Home Assistant watchdog can restart it. Device
+commands are not replayed automatically after a disconnect.
+
 ### Build the Docker image
 ```bash
 docker build -t tydom2mqtt .

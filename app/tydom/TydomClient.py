@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import ssl
-import sys
 
 import websockets
 import requests
@@ -148,7 +147,9 @@ class TydomClient:
             "Sec-WebSocket-Key": self.generate_random_key(),
             "Sec-WebSocket-Version": "13",
         }
-        conn = http.client.HTTPSConnection(self.host, 443, context=self.ssl_context)
+        conn = http.client.HTTPSConnection(
+            self.host, 443, context=self.ssl_context, timeout=self.reply_timeout
+        )
 
         # Get first handshake
         conn.request(
@@ -196,19 +197,15 @@ class TydomClient:
             Connecting to webSocket server
             websockets.client.connect returns a WebSocketClientProtocol, which is used to send and receive messages
         """
-        try:
-            self.connection = await websockets.connect(
-                f"wss://{self.host}:443/mediation/client?mac={self.mac}&appli=1",
-                additional_headers=websocket_headers,
-                ssl=websocket_ssl_context,
-                ping_timeout=None,
-            )
-            logger.info("Connected to tydom")
-            self.health_state.update_tydom_status(True)
-            return self.connection
-        except Exception as e:
-            logger.error("Exception when trying to connect with websocket (%s)", e)
-            sys.exit(1)
+        self.connection = await websockets.connect(
+            f"wss://{self.host}:443/mediation/client?mac={self.mac}&appli=1",
+            additional_headers=websocket_headers,
+            ssl=websocket_ssl_context,
+            ping_timeout=None,
+        )
+        logger.info("Connected to tydom")
+        self.health_state.update_tydom_status(True)
+        return self.connection
 
     async def disconnect(self):
         if self.connection is not None:
